@@ -1,0 +1,145 @@
+# ─────────────────────────────────────────────────────────────
+# SwagStore – CI/CD Pipeline
+# Triggers: push / PR to any branch
+#           additional "deploy" job runs only on main
+# ─────────────────────────────────────────────────────────────
+name: CI / CD
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+
+# Cancel in-progress runs when a new commit is pushed
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── 1. LINT ────────────────────────────────────────────────
+  lint:
+    name: Lint (Node syntax check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check JS syntax (node --check)
+        run: |
+          find . -name "*.js" \
+            ! -path "./node_modules/*" \
+            ! -path "./.github/*" \
+            -exec node --check {} \;
+
+  # ── 2. UNIT + INTEGRATION TESTS ───────────────────────────
+  test:
+    name: Test (Node ${{ matrix.node }})
+    needs: lint
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node: ['18', '20', '22']   # test on LTS + current
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests with coverage
+        run: npm run test:coverage
+
+      - name: Upload coverage report
+        if: matrix.node == '20'        # upload only once
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 7
+
+  # ── 3. BUILD VERIFICATION ─────────────────────────────────
+  build:
+    name: Build verification
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install production deps only
+        run: npm ci --omit=dev
+
+      - name: Verify app starts and exits cleanly
+        run: |
+          timeout 5 node -e "
+            const createApp = require('./app');
+            const app = createApp();
+            const server = app.listen(0, () => {
+              console.log('✅ App started on port', server.address().port);
+              server.close(() => process.exit(0));
+            });
+          " || true
+
+      - name: Create release archive
+        run: |
+          mkdir -p dist
+          zip -r dist/swagstore.zip . \
+            --exclude "node_modules/*" \
+            --exclude ".git/*" \
+            --exclude "coverage/*" \
+            --exclude "dist/*" \
+            --exclude "*.bak"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: swagstore-build-${{ github.sha }}
+          path: dist/swagstore.zip
+          retention-days: 14
+
+  # ── 4. DEPLOY (main branch only) ──────────────────────────
+  deploy:
+    name: Deploy to Railway
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci --omit=dev
+
+      - name: Deploy to Railway
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          npm install -g @railway/cli
+          npx @railway/cli up --service swagstore
